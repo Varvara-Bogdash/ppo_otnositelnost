@@ -1,164 +1,76 @@
-//ЛАЗЕРНЫЙ МОДУЛЬ
 #include <SPI.h>
 #include <RF24.h>
-#include <Servo.h>
 
-const int PAN_PIN = 5;
-const int TILT_PIN = 6;
-const int LASER_PIN = 2;
+RF24 radio(10, 9); // CE=10, CSN=9
 
-Servo servoPan;
-Servo servoTilt;
-RF24 radio(9, 10);
+// Адреса для двусторонней связи
+const byte addressTX[5] = {0xE7, 0xE7, 0xE7, 0xE7, 0xE7}; // для отправки
+const byte addressRX[5] = {0xC2, 0xC2, 0xC2, 0xC2, 0xC2}; // для приёма
 
-const uint8_t pipeFromController[6] = "LASER";
-const uint8_t pipeToController[6] = "CTRLR";
 
-bool scanning = false;
-bool laserOn = true;
-
-const int routePan[] = {
-  0, -10, -20, -30, -40, -30, -20, -10, 0, 10, 20, 30, 40, 30, 20, 10, 0,
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  -10, -20, -30, -40, -30, -20, -10, 0, 10, 20, 30, 40,
-  30, 20, 10, 0, -10, -20, -30, -40,
-  -30, -20, -10, 0,
-  10, 20, 30, 40,
-  30, 20, 10, 0
+// Структура для приема отчета
+struct FeedbackPacket {
+  byte servo1_angle;
+  byte servo2_angle;
 };
-
-const int routeTilt[] = {
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-  0, -10, -20, -30, -40, -30, -20, -10, 0, 10, 20, 30, 40, 30, 20, 10, 0,
-  -10, -20, -30, -40, -30, -20, -10, 0, 10, 20, 30, 40,
-  40, 40, 40, 40, 40, 40, 40, 40,
-  30, 20, 10, 0,
-  -10, -20, -30, -40,
-  -30, -20, -10, 0
-};
-
-const int routeLength = sizeof(routePan) / sizeof(routePan[0]);
-
-int routeIndex = 0;
-unsigned long lastAction = 0;
-const unsigned long scanInterval = 3000;
-
-struct LaserPacket {
-  uint8_t deviceId = 1;
-  int16_t panAngle = 0;
-  int16_t tiltAngle = 0;
-  uint8_t mode = 0;
-};
-
-int angleToServo(int angle) {
-  return map(angle, -40, 40, 50, 130);
-}
-
-void setLaserPosition(int pan, int tilt) {
-  servoPan.write(angleToServo(pan));
-  servoTilt.write(angleToServo(tilt));
-}
-
-void updateLaser() {
-  digitalWrite(LASER_PIN, laserOn ? HIGH : LOW);
-}
 
 void setup() {
   Serial.begin(9600);
-  servoPan.attach(PAN_PIN);
-  servoTilt.attach(TILT_PIN);
-  pinMode(LASER_PIN, OUTPUT);
-  
-  laserOn = true;
-  updateLaser();
-  
-  // Установка начальных позиций сервоприводов согласно ТЗ:
-  // Пин 5 (PAN) → 120°, Пин 6 (TILT) → 110°
-  servoPan.write(120);
-  servoTilt.write(110);
-  delay(500); // Пауза для завершения движения сервоприводов
+  radio.printDetails();
+  radio.setAutoAck(true);        // Включить подтверждение получения
+  radio.setRetries(15, 15);      // 15 попыток с задержкой 15*250 мкс
+  radio.setCRCLength(RF24_CRC_16); // Включить CRC-проверку
+  Serial.println("=== NRF24L01 Передатчик ===");
+  Serial.println("Введите 1-4 для отправки команды");
 
-  radio.begin();
-  radio.setPALevel(RF24_PA_LOW);
-  radio.setDataRate(RF24_2MBPS);
-  radio.setRetries(3, 5);
-  radio.openReadingPipe(1, pipeFromController);
-  radio.startListening();
-
-  Serial.println("✅ Лазер готов. Ожидание команды 'start'.");
-}
-
-void sendTelemetry(int pan, int tilt, uint8_t mode) {
-  LaserPacket pkt;
-  pkt.deviceId = 1;
-  pkt.panAngle = pan;
-  pkt.tiltAngle = tilt;
-  pkt.mode = mode;
-
-  radio.stopListening();
-  radio.openWritingPipe(pipeToController);
-  radio.write(&pkt, sizeof(pkt));
-  radio.startListening();
-  radio.openReadingPipe(1, pipeFromController);
-
-  Serial.print("📤 PAN=");
-  Serial.print(pan);
-  Serial.print(", TILT=");
-  Serial.print(tilt);
-  Serial.print(", MODE=");
-  Serial.println(mode);
-}
-
-void performScanStep() {
-  if (!scanning) return;
-  if (millis() - lastAction < scanInterval) return;
-
-  if (routeIndex >= routeLength) {
-    setLaserPosition(0, 0);
-    sendTelemetry(0, 0, 0);
-    scanning = false;
-    routeIndex = 0;
-    Serial.println("🏁 Сканирование завершено.");
-    return;
+  if (!radio.begin()) {
+    Serial.println("Ошибка: Модуль NRF24L01 не отвечает!");
+    while (1) {}
   }
 
-  int pan = routePan[routeIndex];
-  int tilt = routeTilt[routeIndex];
+  // --- Явная настройка канала и скорости (одинаково с приемником) ---
+  radio.setChannel(76);          // Канал 76 (2.476 ГГц)
+  radio.setDataRate(RF24_1MBPS); // Скорость 1 Mbps
+  radio.setPALevel(RF24_PA_MIN); // Минимальная мощность
 
-  setLaserPosition(pan, tilt);
-  sendTelemetry(pan, tilt, 1);
-
-  routeIndex++;
-  lastAction = millis();
-}
-
-void handleCommand(const char* cmd) {
-  Serial.print("📥 ");
-  Serial.println(cmd);
-
-  if (strcmp(cmd, "start") == 0) {
-    if (!scanning) {
-      scanning = true;
-      routeIndex = 0;
-      lastAction = millis() - scanInterval;
-      Serial.println("🟢 Сканирование запущено");
-    }
-  } else if (strcmp(cmd, "laseron") == 0) {
-    laserOn = true; updateLaser(); Serial.println("🔦 ON");
-  } else if (strcmp(cmd, "laseroff") == 0) {
-    laserOn = false; updateLaser(); Serial.println("🌑 OFF");
-  } else if (strcmp(cmd, "vertos") == 0) {
-    setLaserPosition(0, 5); delay(200); setLaserPosition(0, 0); Serial.println("↕️ vertos");
-  } else if (strcmp(cmd, "goros") == 0) {
-    setLaserPosition(5, 0); delay(200); setLaserPosition(0, 0); Serial.println("↔️ goros");
-  }
+  // Настройка двусторонней связи
+  radio.openWritingPipe(addressTX);     // Труба для отправки команд
+  radio.openReadingPipe(1, addressRX);  // Труба для приема отчетов
+  radio.startListening(); // Начинаем слушать отчеты
 }
 
 void loop() {
+  // --- Прием отчетов от приемника ---
   if (radio.available()) {
-    char cmd[16] = {0};
-    radio.read(cmd, sizeof(cmd));
-    handleCommand(cmd);
+    FeedbackPacket feedback;
+    radio.read(&feedback, sizeof(FeedbackPacket));
+    Serial.print("[Прием] Серво1: ");
+    Serial.print(feedback.servo1_angle);
+    Serial.print("°, Серво2: ");
+    Serial.print(feedback.servo2_angle);
+    Serial.println("°");
   }
-  if (scanning) performScanStep();
+
+  // --- Отправка команд через Serial Monitor ---
+  if (Serial.available() > 0) {
+    char commandChar = Serial.read();
+    if (commandChar == '\n' || commandChar == '\r') return;
+
+    byte commandToSend = commandChar - '0';
+    if (commandToSend >= 1 && commandToSend <= 4) {
+      radio.stopListening(); // Переключаемся в режим передачи
+
+      if (radio.write(&commandToSend, sizeof(commandToSend))) {
+        Serial.print("[Отправка] Команда '");
+        Serial.print(commandToSend);
+        Serial.println("' успешно отправлена!");
+      } else {
+        Serial.println("[Ошибка] Не удалось отправить команду!");
+      }
+
+      radio.startListening(); // Возвращаемся в режим приема
+    } else {
+      Serial.println("[Ошибка] Введите команду от 1 до 4");
+    }
+  }
 }
